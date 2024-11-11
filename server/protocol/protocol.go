@@ -154,6 +154,14 @@ type TableData struct {
 	Updated string                   `json:"updated"`  // 添加更新时间
 }
 
+// ColumnType 定义列的数据类型
+type ColumnType string
+
+const (
+	IntType    ColumnType = "int"
+	StringType ColumnType = "string"
+)
+
 type ColumnData struct {
 	Name     string     `json:"name"`
 	Type     ColumnType `json:"type"`

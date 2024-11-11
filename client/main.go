@@ -5,14 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"bufio"
-	"os"
 	"strings"
 	"strconv"
 	"time"
 	"io"
 	"sort"
-	"../server/protocol"  // 引入 protocol 包
+	"github.com/liubaotong/mem-db/server/protocol"
+	"github.com/chzyer/readline"
 )
 
 // 添加客户端配置
@@ -25,7 +24,7 @@ type Client struct {
 	conn     net.Conn
 	encoder  *json.Encoder
 	decoder  *json.Decoder
-	scanner  *bufio.Scanner
+	rl       *readline.Instance
 }
 
 func NewClient() (*Client, error) {
@@ -46,11 +45,23 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("无法连接到服务器: %v", err)
 	}
 
+	// 初始化 readline
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "> ",
+		HistoryFile:     "/tmp/mem-db.history",
+		HistoryLimit:    1000,
+		AutoComplete:    completer{},
+	})
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("初始化命令行失败: %v", err)
+	}
+
 	return &Client{
 		conn:     conn,
 		encoder:  json.NewEncoder(conn),
 		decoder:  json.NewDecoder(conn),
-		scanner:  bufio.NewScanner(os.Stdin),
+		rl:       rl,
 	}, nil
 }
 
@@ -58,19 +69,28 @@ func (c *Client) Close() {
 	if c.conn != nil {
 		c.conn.Close()
 	}
+	if c.rl != nil {
+		c.rl.Close()
+	}
 }
 
 func (c *Client) Run() {
 	fmt.Println("连接到服务器成功。输入 HELP 查看支持的命令。")
 	
 	for {
-		fmt.Print("> ")
-		if !c.scanner.Scan() {
+		line, err := c.rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt {
+				continue
+			} else if err == io.EOF {
+				break
+			}
+			fmt.Printf("错误: %v\n", err)
 			break
 		}
 
-		input := c.scanner.Text()
-		if strings.TrimSpace(input) == "" {
+		input := strings.TrimSpace(line)
+		if input == "" {
 			continue
 		}
 
@@ -92,6 +112,42 @@ func (c *Client) Run() {
 			}
 		}
 	}
+}
+
+// 添加命令自动完成
+type completer struct{}
+
+func (c completer) Do(line []rune, pos int) (newLine [][]rune, length int) {
+	commands := []string{
+		"CREATE TABLE ",
+		"INSERT INTO ",
+		"SELECT * FROM ",
+		"UPDATE ",
+		"DELETE FROM ",
+		"SAVE",
+		"EXIT",
+		"HELP",
+	}
+
+	lineStr := string(line)
+	var matches []string
+
+	for _, cmd := range commands {
+		if strings.HasPrefix(strings.ToUpper(cmd), strings.ToUpper(lineStr)) {
+			matches = append(matches, cmd)
+		}
+	}
+
+	if len(matches) == 0 {
+		return
+	}
+
+	var suggestions [][]rune
+	for _, match := range matches {
+		suggestions = append(suggestions, []rune(match))
+	}
+
+	return suggestions, len(lineStr)
 }
 
 func (c *Client) handleCommand(input string) error {
@@ -250,7 +306,10 @@ func parseCreateTable(args []string) protocol.Command {
 
 	// 解析列定义
 	columnDefs := strings.Split(columnsStr[start+1:end], ",")
-	columns := make([]struct{Name string; Type string}, 0)
+	columns := make([]struct{
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}, 0)
 	
 	for _, def := range columnDefs {
 		parts := strings.Fields(strings.TrimSpace(def))
@@ -263,7 +322,10 @@ func parseCreateTable(args []string) protocol.Command {
 			return protocol.Command{Type: -1}
 		}
 		
-		columns = append(columns, struct{Name string; Type string}{
+		columns = append(columns, struct{
+			Name string `json:"name"`
+			Type string `json:"type"`
+		}{
 			Name: parts[0],
 			Type: colType,
 		})
@@ -271,52 +333,106 @@ func parseCreateTable(args []string) protocol.Command {
 
 	return protocol.Command{
 		Type: protocol.CreateTable,
-		Payload: protocol.CreateTablePayload{
-			TableName: tableName,
-			Columns:   columns,
-		},
+			Payload: protocol.CreateTablePayload{
+				TableName: tableName,
+				Columns:   columns,
+			},
 	}
 }
 
 // 解析 INSERT 命令
 func parseInsert(args []string) protocol.Command {
-	// INSERT INTO tablename VALUES (value1, value2, ...)
-	if len(args) < 4 || strings.ToUpper(args[0]) != "INTO" || strings.ToUpper(args[2]) != "VALUES" {
+	// INSERT INTO tablename (col1, col2, ...) VALUES (value1, value2, ...)
+	if len(args) < 4 || strings.ToUpper(args[0]) != "INTO" {
 		return protocol.Command{Type: -1}
 	}
 
 	tableName := args[1]
-	valuesStr := strings.Join(args[3:], " ")
-	
-	// 提取括号中的内容
-	start := strings.Index(valuesStr, "(")
-	end := strings.LastIndex(valuesStr, ")")
-	if start == -1 || end == -1 || start >= end {
+	restStr := strings.Join(args[2:], " ")
+
+	// 查找列名列表和值列表
+	colStart := strings.Index(restStr, "(")
+	colEnd := strings.Index(restStr, ")")
+	if colStart == -1 || colEnd == -1 || colStart >= colEnd {
+		return protocol.Command{Type: -1}
+	}
+
+	// 提取并解析列名
+	colStr := restStr[colStart+1:colEnd]
+	columns := parseColumnList(colStr)
+	if len(columns) == 0 {
+		return protocol.Command{Type: -1}
+	}
+
+	// 查找 VALUES 关键字
+	valuesIdx := strings.Index(strings.ToUpper(restStr[colEnd+1:]), "VALUES")
+	if valuesIdx == -1 {
+		return protocol.Command{Type: -1}
+	}
+	valuesIdx += colEnd + 1
+
+	// 提取值列表
+	valuesPart := restStr[valuesIdx+6:]
+	valStart := strings.Index(valuesPart, "(")
+	valEnd := strings.LastIndex(valuesPart, ")")
+	if valStart == -1 || valEnd == -1 || valStart >= valEnd {
 		return protocol.Command{Type: -1}
 	}
 
 	// 解析值
-	valueStrs := strings.Split(valuesStr[start+1:end], ",")
-	values := make(map[string]interface{})
-	
-	for i, val := range valueStrs {
-		val = strings.TrimSpace(val)
-		// 尝试解析为整数
-		if intVal, err := strconv.Atoi(val); err == nil {
-			values[fmt.Sprintf("col%d", i+1)] = intVal
-			continue
-		}
-		// 如果不是整数，去掉引号作为字符串处理
-		values[fmt.Sprintf("col%d", i+1)] = strings.Trim(val, "\"'")
+	valStr := valuesPart[valStart+1:valEnd]
+	values := parseValueList(valStr)
+	if len(values) != len(columns) {
+		return protocol.Command{Type: -1}
+	}
+
+	// 将列名和值组合成map
+	valueMap := make(map[string]interface{})
+	for i, col := range columns {
+		valueMap[col] = values[i]
 	}
 
 	return protocol.Command{
 		Type: protocol.Insert,
 		Payload: protocol.InsertPayload{
 			TableName: tableName,
-			Values:    values,
+			Values:    valueMap,
 		},
 	}
+}
+
+// 解析列名列表
+func parseColumnList(colStr string) []string {
+	var columns []string
+	for _, col := range strings.Split(colStr, ",") {
+		col = strings.TrimSpace(col)
+		if col != "" {
+			columns = append(columns, col)
+		}
+	}
+	return columns
+}
+
+// 解析值列表
+func parseValueList(valStr string) []interface{} {
+	var values []interface{}
+	for _, val := range strings.Split(valStr, ",") {
+		val = strings.TrimSpace(val)
+		if val == "" {
+			continue
+		}
+
+		// 尝试解析为整数
+		if intVal, err := strconv.Atoi(val); err == nil {
+			values = append(values, intVal)
+			continue
+		}
+
+		// 如果不是整数，去掉引号作为字符串处理
+		strVal := strings.Trim(val, "\"'")
+		values = append(values, strVal)
+	}
+	return values
 }
 
 // 解析 SELECT 命令
@@ -383,7 +499,7 @@ func parseUpdate(args []string) protocol.Command {
 		}
 	}
 
-	// 解析 SET 子句
+	// 解析 SET 子
 	setArgs := args[3:]
 	if whereIndex != -1 {
 		setArgs = args[3:whereIndex]
@@ -531,7 +647,7 @@ func printHelp() {
 	fmt.Println("\n支持的命令格式：")
 	fmt.Println("1. CREATE TABLE tablename (column1 type1, column2 type2, ...)")
 	fmt.Println("   支持的类型：int, string")
-	fmt.Println("2. INSERT INTO tablename VALUES (value1, value2, ...)")
+	fmt.Println("2. INSERT INTO tablename (column1, column2, ...) VALUES (value1, value2, ...)")
 	fmt.Println("3. SELECT * FROM tablename [WHERE condition1=value1 AND condition2=value2]")
 	fmt.Println("4. UPDATE tablename SET column1=value1 [, column2=value2] [WHERE condition1=value1]")
 	fmt.Println("5. DELETE FROM tablename [WHERE condition1=value1]")
@@ -539,7 +655,7 @@ func printHelp() {
 	fmt.Println("7. EXIT")
 	fmt.Println("\n示例：")
 	fmt.Println("CREATE TABLE users (id int, name string, age int)")
-	fmt.Println("INSERT INTO users VALUES (1, \"Alice\", 20)")
+	fmt.Println("INSERT INTO users (id, name, age) VALUES (1, \"Alice\", 20)")
 	fmt.Println("SELECT * FROM users WHERE age=20")
 	fmt.Println("UPDATE users SET age=21 WHERE name=\"Alice\"")
 	fmt.Println("DELETE FROM users WHERE id=1")

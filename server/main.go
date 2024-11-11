@@ -8,9 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"path/filepath"
-	"github.com/liubaotong/mem-db/db"
-	"github.com/liubaotong/mem-db/protocol"
+	"github.com/liubaotong/mem-db/server/db"
+	"github.com/liubaotong/mem-db/server/protocol"
 )
 
 const (
